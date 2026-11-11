@@ -157,6 +157,8 @@ jobs:
           if [ "${{ matrix.name }}" = "macos" ]; then
             for t in aarch64-apple-darwin x86_64-apple-darwin; do
               cargo build -p maj-bridge -p maj-mcp --release --target "$t"
+              # The universal build compiles each arch and looks up its own sidecar too.
+              for b in maj-bridge maj-mcp; do cp "target/$t/release/$b" "$BIN/$b-$t"; done
             done
             for b in maj-bridge maj-mcp; do
               lipo -create -output "$BIN/$b-universal-apple-darwin" \

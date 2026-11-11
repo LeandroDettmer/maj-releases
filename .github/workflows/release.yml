@@ -1,0 +1,289 @@
+# Release MAJ from the private source repo (LeandroDettmer/maj) into this public repo.
+#   gh workflow run release.yml -R LeandroDettmer/maj-releases -f tag=vX.Y.Z
+# The tag must already exist in LeandroDettmer/maj and equal apps/desktop/src-tauri/tauri.conf.json
+# "version". Builds macOS (universal) / Windows (NSIS) / Linux (AppImage + .deb) in parallel, signs
+# the updater artifacts with the minisign key, uploads standalone maj-mcp binaries, writes
+# latest.json and publishes the GitHub Release here.
+# Installed apps poll https://github.com/LeandroDettmer/maj-releases/releases/latest/download/latest.json.
+# Secrets (this repo): MAJ_SOURCE_DEPLOY_KEY (read-only deploy key of LeandroDettmer/maj),
+# TAURI_SIGNING_PRIVATE_KEY (minisign key). Docs: docs/RELEASE.md in the source repo.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag in LeandroDettmer/maj to build and release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag }}
+  NODE_VERSION: "22"
+
+jobs:
+  # Draft release first: every matrix job uploads into it, `publish` flips it public only when
+  # all three platforms succeeded (so `releases/latest` never points at a half-built release).
+  create-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: LeandroDettmer/maj
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.MAJ_SOURCE_DEPLOY_KEY }}
+
+      # The updater compares latest.json "version" with the running binary's version. A tag
+      # that differs from tauri.conf.json would ship a binary that keeps "updating" to itself.
+      - name: Tag must match tauri.conf.json version
+        run: |
+          CONF="v$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
+          if [ "$CONF" != "$TAG" ]; then
+            echo "::error::Tag $TAG != tauri.conf.json version $CONF. Bump the version (tauri.conf.json, Cargo.toml, package.json) and re-tag."
+            exit 1
+          fi
+
+      # The release (and its tag, on this repo's default branch) lives in this public repo.
+      - name: Create (or reuse) draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -1)
+          if [ -z "$ID" ]; then
+            ID=$(gh api "repos/$GITHUB_REPOSITORY/releases" -X POST \
+              -f tag_name="$TAG" -f name="MAJ $TAG" -F draft=true \
+              -f body="Downloads and install notes: see the README." \
+              --jq .id)
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            name: macos
+            # One universal binary serves darwin-aarch64 and darwin-x86_64.
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin --bundles app,dmg
+            mcp_asset: maj-mcp-darwin-universal.tar.gz
+          - platform: windows-latest
+            name: windows
+            rust_targets: ""
+            args: --bundles nsis
+            mcp_asset: maj-mcp-windows-x64.zip
+          # 22.04 (glibc 2.35): the AppImage links the system glibc; a newer runner would
+          # exclude older distros. AppImage is the Linux updater artifact — .deb alone has none.
+          - platform: ubuntu-22.04
+            name: linux
+            rust_targets: ""
+            args: --bundles appimage,deb
+            mcp_asset: maj-mcp-linux-x64.tar.gz
+    runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_TERM_COLOR: always
+      # The key has no password. Tauri still wants the variable set (else it may prompt).
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: LeandroDettmer/maj
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.MAJ_SOURCE_DEPLOY_KEY }}
+
+      - name: Install Linux system deps (Tauri)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev file
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      # Runs are dispatched from main, so the cache is saved here and reused by the next release.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - run: npm --prefix apps/desktop ci
+
+      # The secret must be the one-line content of the .key file. Pasted keys often carry
+      # spaces/newlines → minisign fails with "Invalid symbol 32". Strip all whitespace.
+      - name: Prepare signing key
+        shell: bash
+        env:
+          RAW_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RAW_KEY" | tr -d ' \n\r\t' > "$RUNNER_TEMP/tauri_signing.key"
+          if ! [ -s "$RUNNER_TEMP/tauri_signing.key" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is empty. Set it to the content of the .key file (see docs/RELEASE.md)."
+            exit 1
+          fi
+          echo "TAURI_SIGNING_PRIVATE_KEY=$RUNNER_TEMP/tauri_signing.key" >> "$GITHUB_ENV"
+
+      # The app bundles the browser extension (resource), the native-messaging host and the
+      # MCP server (sidecars `maj-bridge-<target triple>`, `maj-mcp-<target triple>`);
+      # see src-tauri/tauri.bundle.conf.json.
+      - name: Build extension + native-messaging host
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix apps/extension ci
+          npm --prefix apps/extension run build
+          BIN=apps/desktop/src-tauri/binaries
+          mkdir -p "$BIN"
+          if [ "${{ matrix.name }}" = "macos" ]; then
+            for t in aarch64-apple-darwin x86_64-apple-darwin; do
+              cargo build -p maj-bridge -p maj-mcp --release --target "$t"
+            done
+            for b in maj-bridge maj-mcp; do
+              lipo -create -output "$BIN/$b-universal-apple-darwin" \
+                "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+            done
+          else
+            EXT=""; [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+            cargo build -p maj-bridge -p maj-mcp --release
+            for b in maj-bridge maj-mcp; do
+              cp "target/release/$b$EXT" "$BIN/$b-$(rustc -vV | sed -n 's/host: //p')$EXT"
+            done
+          fi
+
+      # Standalone MCP server for people without the desktop app (`npx -y maj-mcp` downloads
+      # these). Each archive holds only the maj-mcp binary built in the step above.
+      - name: Package standalone maj-mcp + upload to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          ASSET: ${{ matrix.mcp_asset }}
+        run: |
+          set -euo pipefail
+          PKG=mcp-pkg
+          rm -rf "$PKG" && mkdir "$PKG"
+          case "${{ matrix.name }}" in
+            macos)
+              cp apps/desktop/src-tauri/binaries/maj-mcp-universal-apple-darwin "$PKG/maj-mcp"
+              chmod 755 "$PKG/maj-mcp"
+              tar -czf "$PKG/$ASSET" -C "$PKG" maj-mcp ;;
+            linux)
+              cp target/release/maj-mcp "$PKG/maj-mcp"
+              chmod 755 "$PKG/maj-mcp"
+              tar -czf "$PKG/$ASSET" -C "$PKG" maj-mcp ;;
+            windows)
+              cp target/release/maj-mcp.exe "$PKG/maj-mcp.exe"
+              (cd "$PKG" && pwsh -NoProfile -Command "Compress-Archive -Path maj-mcp.exe -DestinationPath '$ASSET' -Force") ;;
+          esac
+          OLD_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --jq ".[] | select(.name == \"$ASSET\") | .id")
+          [ -z "$OLD_ID" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$OLD_ID"
+          curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary "@$PKG/$ASSET" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$ASSET" > /dev/null
+          echo "Uploaded $ASSET"
+
+      # Typecheck stays in the release build (beforeBuildCommand = `tsc --noEmit && vite build`).
+      - name: Build + upload to draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: apps/desktop
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          includeUpdaterJson: false # latest.json is written once, in `publish`, with the guard below
+          args: ${{ matrix.args }} --config src-tauri/tauri.bundle.conf.json
+
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+    steps:
+      # Updater manifest. Legacy guard (FiveDollars pitfall): merge with the previous public
+      # latest.json, then keep only platforms whose URL points at the MAX version. Otherwise a
+      # platform missing from this build would keep an old URL under a newer "version" and its
+      # clients would download the old build, reinstall and check again — forever. A dropped
+      # platform just gets "platform not found" until its build ships.
+      - name: Write latest.json
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          mkdir -p out
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" > out/assets.json
+
+          sig_of() { # $1 = asset name → its .sig content (draft assets need the API download)
+            local id
+            id=$(jq -r --arg n "$1.sig" '.[] | select(.name == $n) | .id' out/assets.json)
+            [ -n "$id" ] || { echo "::error::missing $1.sig"; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$id" -H "Accept: application/octet-stream" | tr -d '\n'
+          }
+          pick() { # $1 = jq regex on asset name → first matching non-.sig asset
+            jq -r --arg re "$1" '[.[] | .name | select(test($re)) | select(endswith(".sig") | not)][0] // empty' out/assets.json
+          }
+
+          PLATFORMS="{}"
+          add() { # $1 = updater key, $2 = asset name
+            [ -n "$2" ] || { echo "::warning::no asset for $1"; return 0; }
+            PLATFORMS=$(jq -c --arg k "$1" --arg url "$BASE/$2" --arg sig "$(sig_of "$2")" \
+              '. + {($k): {url: $url, signature: $sig}}' <<< "$PLATFORMS")
+          }
+          MAC=$(pick '\.app\.tar\.gz$')
+          add darwin-aarch64 "$MAC"
+          add darwin-x86_64 "$MAC"
+          add windows-x86_64 "$(pick '-setup\.exe$')"
+          add linux-x86_64 "$(pick '\.AppImage$')"
+
+          OLD="{}"
+          if curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json" -o out/prev.json; then
+            OLD=$(jq -c '.platforms // {}' out/prev.json)
+          fi
+          MERGED=$(jq -n --argjson old "$OLD" --argjson new "$PLATFORMS" '$old * $new')
+
+          MAX=$(jq -r '[ .[] | .url | (capture("releases/download/v(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)/") // empty) | .v ]
+                       | sort_by(split(".") | map(tonumber)) | last // empty' <<< "$MERGED")
+          [ -n "$MAX" ] || MAX="$VERSION"
+          if [ "$MAX" != "$VERSION" ]; then
+            echo "::error::Previous release is v$MAX, newer than $TAG. Refusing to publish a downgrade manifest."
+            exit 1
+          fi
+          FINAL=$(jq -c --arg max "$MAX" \
+            'to_entries | map(select(.value.url | contains("releases/download/v" + $max + "/"))) | from_entries' <<< "$MERGED")
+          [ "$FINAL" != "{}" ] || { echo "::error::no signed updater artifact found"; exit 1; }
+
+          jq -n --arg v "$MAX" --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "$FINAL" \
+            '{version: $v, notes: "See the release page.", pub_date: $d, platforms: $p}' > out/latest.json
+          cat out/latest.json
+
+      - name: Upload latest.json and publish release
+        run: |
+          set -euo pipefail
+          OLD_ID=$(jq -r '.[] | select(.name == "latest.json") | .id' out/assets.json)
+          [ -z "$OLD_ID" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$OLD_ID"
+          UPLOAD="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=latest.json"
+          curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+            --data-binary @out/latest.json "$UPLOAD" > /dev/null
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -f make_latest=true > /dev/null
+          echo "Published $TAG"

@@ -79,6 +79,15 @@ Instant Replay page snapshots mask form fields but keep the page's visible text.
 before you share it. Parts of a page can be excluded by its developer with the `maj-block` class or
 the `data-maj-mask` attribute.
 
+**Optional: Capture credentials (off by default).** The popup has a "Capture credentials" switch for
+debugging login and session problems. Only while you turn it on, the extension keeps login and
+session data that is otherwise masked: the headers listed above, fields named like `password`,
+`token`, `session`, `auth`, `sid` or `signature`, and JWT / `Bearer` / API-key values. Personal data
+stays masked even then (e-mail addresses, phone numbers, card numbers and `card`/`cvv` fields,
+CPF/CNPJ/SSN), and values typed into form fields are still never recorded. A recording made with it
+on can let anyone who has the file sign in as you; use it with test accounts. Like everything
+else, that data stays on your computer unless you share the recording.
+
 ## 4. Where the data goes
 
 - **With MAJ Desktop installed:** the extension sends the session to the MAJ Desktop app on the
